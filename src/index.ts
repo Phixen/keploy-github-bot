@@ -18,13 +18,14 @@ export default (app: Probot) => {
     const issue = context.payload.issue;
     if (issue.pull_request) {
       handleKeployTest(context);
+    } else {
+      context.log.info("Not a pull request");
+      handleKeployTest(context);
     }
   });
 
 
   app.on("workflow_run.completed", async (context) => {
-    console.log("Workflow run completed");
-    console.log(context.payload);
     await handleWorkflowRunCompleted(context);
   });
 };

@@ -1,22 +1,25 @@
 import { Context } from "probot";
 import { IssueCommentCreatedEvent, WorkflowRunCompletedEvent } from "@octokit/webhooks-types";
+import * as yaml from 'yaml';
 
 export async function handleKeployTest(context: Context) {
     const { comment, repository, sender, issue } = context.payload as IssueCommentCreatedEvent;
+
+    const workflow_id = 'keploy-test.yml';
     if (sender.login === "github-actions[bot]") {
         return;
     }
     if (comment.body.includes("/keploy-test")) {
-        // Post welcome message with loader
         const welcomeComment = await context.octokit.issues.createComment(context.issue({
-            body: "🚀 Welcome to Keploy!\n\n Preparing to generate test cases... This may take a while.",
+            body: "🚀 Initiating Keploy Test...",
         }));
+
         try {
-            // check if the workflow file exists in the repository
+            // Attempt to dispatch the workflow
             const workflowExists = await context.octokit.actions.getWorkflow({
                 owner: repository.owner.login,
                 repo: repository.name,
-                workflow_id: 'main.yml',
+                workflow_id: workflow_id,
             });
 
             if (!workflowExists) {
@@ -34,22 +37,25 @@ export async function handleKeployTest(context: Context) {
                 pull_number: issue.number,
             });
 
-            const workflow_id = 'main.yml';
+
             await context.octokit.actions.createWorkflowDispatch({
                 owner: repository.owner.login,
                 repo: repository.name,
-                workflow_id: workflow_id, // Make sure this file exists in .github/workflows/
-                ref: pr.data.head.ref,
+                workflow_id: workflow_id,
+                ref: pr.data.head.ref, // Ensure this is the correct reference
             });
-
             await context.octokit.issues.updateComment({
                 ...context.repo(),
                 comment_id: welcomeComment.data.id,
-                body: `🐇 Running Keploy Test Workflow... 🐰 The workflow will add a comment with test results. (Date and time)`,
+                body: "🚀 Keploy Test Workflow has been dispatched successfully!",
             });
         } catch (error) {
             console.error('Error:', error);
-            return;
+            await context.octokit.issues.updateComment({
+                ...context.repo(),
+                comment_id: welcomeComment.data.id,
+                body: "❌ Failed to dispatch Keploy Test Workflow. Please check the configuration.",
+            });
         }
     }
 }
@@ -57,15 +63,11 @@ export async function handleKeployTest(context: Context) {
 export async function handleWorkflowRunCompleted(context: Context) {
     const { workflow_run, repository } = context.payload as WorkflowRunCompletedEvent;
 
-    if (workflow_run.name !== "Display Current Date and Time" || workflow_run.conclusion !== "success") {
+    if (workflow_run.name !== "Keploy Test" || workflow_run.conclusion !== "success") {
         return;
     }
 
-
     const headSha = workflow_run.head_sha;
-    let prNumber: number | null = null;
-
-
     // Search for a pull request associated with the head_sha
     const pullRequests = await context.octokit.pulls.list({
         owner: repository.owner.login,
@@ -76,50 +78,87 @@ export async function handleWorkflowRunCompleted(context: Context) {
     // Find PR by matching the head SHA
     const pr = pullRequests.data.find((pr) => pr.head.sha === headSha);
 
+    if (!pr) {
+        console.log("No associated pull request found for this workflow run.");
+        return;
+    }
+
     const artifacts = await context.octokit.actions.listWorkflowRunArtifacts({
         owner: repository.owner.login,
         repo: repository.name,
         run_id: workflow_run.id,
     });
 
-    const dateArtifact = artifacts.data.artifacts.find(
-        (artifact) => artifact.name === "output"
+    const reportArtifact = artifacts.data.artifacts.find(
+        (artifact) => artifact.name === "keploy-reports"
     );
 
-    if (!dateArtifact) {
-        console.log("No output artifact found");
+    if (!reportArtifact) {
+        console.log("No reports artifact found");
         return;
     }
 
     const download = await context.octokit.actions.downloadArtifact({
         owner: repository.owner.login,
         repo: repository.name,
-        artifact_id: dateArtifact.id,
+        artifact_id: reportArtifact.id,
         archive_format: "zip",
     });
 
     const zip = require("adm-zip");
     const admZip = new zip(Buffer.from(download.data as ArrayBuffer));
-    const dateContent = admZip.readAsText("date.txt");
 
-    if (pr) {
-        prNumber = pr.number;
-    } else {
-        console.log("No associated pull request found for this workflow run.");
-        // If no PR is associated, comment on the commit instead
-        await context.octokit.repos.createCommitComment({
-            owner: repository.owner.login,
-            repo: repository.name,
-            commit_sha: headSha,
-            body: `Workflow output: The workflow completed successfully, but no associated pull request was found.`,
-        });
+
+    if (admZip.getEntries().length === 0) {
+        console.log("The downloaded artifact is empty");
         return;
     }
 
-    // If PR number is present, comment on the PR as before
+    console.log("AdmZip:", admZip);
+
+    const reportFiles = admZip.getEntries().filter((entry: any) => {
+        console.log("Entry:", entry.entryName, "IsDirectory:", entry.isDirectory);
+        return !entry.isDirectory && entry.entryName.endsWith('-report.yaml');
+    });
+
+    if (reportFiles.length === 0) {
+        console.log("No report files found. All entries:", admZip.getEntries().map((e: any) => e.entryName));
+        return;
+    }
+    console.log("Report Files:", reportFiles);
+    let reportData: any[] = [];
+
+    reportFiles.forEach((file: any) => {
+        const content = yaml.parse(admZip.readAsText(file)) as any;
+        console.log(content);
+        reportData.push({
+            testSet: content.name,
+            status: content.status,
+            passed: content.success,
+            failed: content.failure,
+            total: content.total
+        });
+    });
+
+    console.log("Report Data:", reportData);
+
+    const markdownTable = generateMarkdownTable(reportData);
+    console.log(markdownTable);
     await context.octokit.issues.createComment({
         ...context.repo(),
-        issue_number: prNumber,
-        body: ` 🐰 Keploy Test Workflow output: ${dateContent}`,
+        issue_number: pr.number,
+        body: markdownTable,
     });
+}
+
+function generateMarkdownTable(data: Array<{ testSet: string; status: string; passed: number; failed: number; total: number; }>): string {
+    let table = `| Test Set | Status | Passed | Failed | Total |\n`;
+    table += `|:---------|:------:|:------:|:------:|:-----:|\n`;
+    data.forEach(row => {
+        const statusEmoji = row.status === 'PASSED' ? '✅' : '❌';
+        const passedColor = row.passed > 0 ? '**' : '';
+        const failedColor = row.failed > 0 ? '**' : '';
+        table += `| \`${row.testSet}\` | ${statusEmoji} ${row.status} | ${passedColor}${row.passed}${passedColor} | ${failedColor}${row.failed}${failedColor} | ${row.total} |\n`;
+    });
+    return `## Test Results\n\n${table}\n\n*Generated by Keploy Test Runner*`;
 }

@@ -1,25 +1,11 @@
-FROM node:alpine as builder
-
-WORKDIR /app/probot/
-
-
-COPY ./package*.json ./
-
-RUN npm install
-
-
-FROM node:alpine as app
-
-WORKDIR /app/probot/
-
-COPY --from=builder /app/probot/node_modules/ ./node_modules/
-COPY . ./
-
-RUN npm run build
-
+FROM node:20-slim
+WORKDIR /usr/src/app
+COPY package.json package-lock.json ./
+RUN npm ci --production
+RUN npm cache clean --force
+ENV NODE_ENV="production"
+COPY . .
 EXPOSE 3000
-
-COPY .env ./
-
+CMD [ "npm", "start" ]
 
 ENTRYPOINT [ "npm", "start" ]
